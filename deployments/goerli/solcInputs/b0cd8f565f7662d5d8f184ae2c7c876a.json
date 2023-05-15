@@ -1,0 +1,38 @@
+{
+  "language": "Solidity",
+  "sources": {
+    "@chainlink/contracts/src/v0.8/interfaces/AutomationCompatibleInterface.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface AutomationCompatibleInterface {\n  /**\n   * @notice method that is simulated by the keepers to see if any work actually\n   * needs to be performed. This method does does not actually need to be\n   * executable, and since it is only ever simulated it can consume lots of gas.\n   * @dev To ensure that it is never called, you may want to add the\n   * cannotExecute modifier from KeeperBase to your implementation of this\n   * method.\n   * @param checkData specified in the upkeep registration so it is always the\n   * same for a registered upkeep. This can easily be broken down into specific\n   * arguments using `abi.decode`, so multiple upkeeps can be registered on the\n   * same contract and easily differentiated by the contract.\n   * @return upkeepNeeded boolean to indicate whether the keeper should call\n   * performUpkeep or not.\n   * @return performData bytes that the keeper should call performUpkeep with, if\n   * upkeep is needed. If you would like to encode data to decode later, try\n   * `abi.encode`.\n   */\n  function checkUpkeep(bytes calldata checkData) external returns (bool upkeepNeeded, bytes memory performData);\n\n  /**\n   * @notice method that is actually executed by the keepers, via the registry.\n   * The data returned by the checkUpkeep simulation will be passed into\n   * this method to actually be executed.\n   * @dev The input to this method should not be trusted, and the caller of the\n   * method should not even be restricted to any single registry. Anyone should\n   * be able call it, and the input should be validated, there is no guarantee\n   * that the data passed in is the performData returned from checkUpkeep. This\n   * could happen due to malicious keepers, racing keepers, or simply a state\n   * change while the performUpkeep transaction is waiting for confirmation.\n   * Always validate the data passed in.\n   * @param performData is the data which was passed back from the checkData\n   * simulation. If it is encoded, it can easily be decoded into other types by\n   * calling `abi.decode`. This data should not be trusted, and should be\n   * validated against the contract's current state.\n   */\n  function performUpkeep(bytes calldata performData) external;\n}\n"
+    },
+    "contracts/Escrow.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.17;\n\nimport \"@chainlink/contracts/src/v0.8/interfaces/AutomationCompatibleInterface.sol\";\n\nerror NoUpkeepNeeded();\n\ncontract Escrow is AutomationCompatibleInterface {\n    /* ======== GLOBAL VARIABLES ======== */\n\n    /** @notice Struct to track possible buyer's request for a refund */\n    struct RefundRequest {\n        uint index;\n        bool isApproved;\n        bool executed;\n    }\n\n    RefundRequest[] public requests;\n\n    address public arbiter;\n    address public beneficiary;\n    address public depositor;\n    // Variable to check if escrow is open/closed\n    bool public isOpen;\n    // Variables for time-lock mechanic\n    uint public lastTimeStamp;\n    uint public interval;\n    uint public fee; // 1%\n\n    /* ======== MODIFIERS ======== */\n    modifier OnlyArbiter() {\n        require(msg.sender == arbiter);\n        _;\n    }\n\n    modifier OnlyDepositor() {\n        require(msg.sender == depositor);\n        _;\n    }\n\n    modifier NotApproved(uint id) {\n        require(requests[id].isApproved == false);\n        _;\n    }\n\n    modifier Approved(uint id) {\n        require(requests[id].isApproved == true);\n        _;\n    }\n\n    modifier NotExecuted(uint id) {\n        require(requests[id].executed == false);\n        _;\n    }\n\n    /* ======== EVENTS ======== */\n    event Deposited(address indexed depositor, uint indexed value);\n\n    event FeeWithdrawn(uint indexed amount);\n    event RefundRequested(uint indexed id);\n    event RefundApproved(uint indexed id);\n    event RefundExecuted(uint indexed id);\n    event TimeLockRefunded();\n\n    /* ======== CONSTRUCTOR ======== */\n    constructor(\n        address _arbiter,\n        address _beneficiary,\n        uint _interval,\n        uint _fee\n    ) payable {\n        require(msg.value > 0, \"Must deposit ETH\");\n        arbiter = _arbiter;\n        beneficiary = _beneficiary;\n        depositor = msg.sender;\n        lastTimeStamp = block.timestamp;\n        interval = _interval;\n        fee = _fee;\n        isOpen = true;\n\n        emit Deposited(depositor, msg.value);\n    }\n\n    /* ======== FUNCTIONS ======== */\n\n    /** @notice Function to approve transfer of funds to the beneficiary */\n    function releaseFunds() public OnlyArbiter {\n        uint balance = (address(this).balance * (1000 - fee)) / 1000;\n        (bool sent, ) = payable(beneficiary).call{value: balance}(\"\");\n        require(sent, \"Failed to send Ether\");\n\n        isOpen = false;\n    }\n\n    /** @notice Function to request refund */\n    function requestRefund() public OnlyDepositor {\n        uint index = requests.length;\n        requests.push(\n            RefundRequest({index: index, isApproved: false, executed: false})\n        );\n\n        emit RefundRequested(index);\n    }\n\n    /** @notice Function to approve refund by its id */\n    function approveRefund(uint id) public OnlyArbiter NotApproved(id) {\n        requests[id].isApproved = true;\n\n        emit RefundApproved(id);\n    }\n\n    function executeRefund(\n        uint id\n    ) public OnlyArbiter Approved(id) NotExecuted(id) {\n        uint balance = (address(this).balance * (1000 - fee)) / 1000;\n        (bool success, ) = payable(depositor).call{value: balance}(\"\");\n        require(success, \"Failed transfer of funds\");\n        requests[id].executed = true;\n\n        isOpen = false;\n        emit RefundExecuted(id);\n    }\n\n    function checkUpkeep(\n        bytes memory /* checkdata */\n    )\n        public\n        view\n        override\n        returns (bool upkeepNeeded, bytes memory /* PerformData */)\n    {\n        bool open = true;\n        bool intervalPassed = (block.timestamp - lastTimeStamp) > interval;\n        bool enoughETH = address(this).balance > 0;\n        upkeepNeeded = (open && intervalPassed && enoughETH);\n        return (upkeepNeeded, \"0x0\");\n    }\n\n    function performUpkeep(bytes calldata /* PerformData */) external override {\n        (bool upkeepNeeded, ) = checkUpkeep(\"\");\n        if (!upkeepNeeded) revert NoUpkeepNeeded();\n\n        uint balance = (address(this).balance * (1000 - fee)) / 1000;\n\n        (bool success, ) = payable(depositor).call{value: balance}(\"\");\n        require(success);\n        isOpen = false;\n\n        emit TimeLockRefunded();\n    }\n\n    function withdrawFees() public OnlyArbiter {\n        uint balance = address(this).balance * (fee / 100);\n        (bool success, ) = payable(arbiter).call{value: balance}(\"\");\n        require(success);\n\n        emit FeeWithdrawn(balance);\n    }\n}\n"
+    }
+  },
+  "settings": {
+    "optimizer": {
+      "enabled": false,
+      "runs": 200
+    },
+    "outputSelection": {
+      "*": {
+        "*": [
+          "abi",
+          "evm.bytecode",
+          "evm.deployedBytecode",
+          "evm.methodIdentifiers",
+          "metadata",
+          "devdoc",
+          "userdoc",
+          "storageLayout",
+          "evm.gasEstimates"
+        ],
+        "": [
+          "ast"
+        ]
+      }
+    },
+    "metadata": {
+      "useLiteralContent": true
+    }
+  }
+}
